@@ -25,21 +25,21 @@ const (
 var (
 	endpointsForTarget = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "kuberesolver_endpoints_total",
+			Name: "seedtag_kuberesolver_endpoints_total",
 			Help: "The number of endpoints for a given target",
 		},
 		[]string{"target"},
 	)
 	addressesForTarget = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "kuberesolver_addresses_total",
+			Name: "seedtag_kuberesolver_addresses_total",
 			Help: "The number of addresses for a given target",
 		},
 		[]string{"target"},
 	)
 	clientLastUpdate = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "kuberesolver_client_last_update",
+			Name: "seedtag_kuberesolver_client_last_update",
 			Help: "The last time the resolver client was updated",
 		},
 		[]string{"target"},
