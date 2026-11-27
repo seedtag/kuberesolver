@@ -256,6 +256,9 @@ func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
 		return nil
 	}
 
+	// The same for every address of this resolver: build it once, not per address.
+	serverName := k.target.serviceName + "." + k.target.serviceNamespace
+
 	var newAddrs []resolver.Address
 
 	for _, endpoint := range e.Endpoints {
@@ -266,7 +269,7 @@ func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
 		for _, address := range endpoint.Addresses {
 			newAddrs = append(newAddrs, resolver.Address{
 				Addr:       net.JoinHostPort(address, port),
-				ServerName: fmt.Sprintf("%s.%s", k.target.serviceName, k.target.serviceNamespace),
+				ServerName: serverName,
 				Metadata:   nil,
 			})
 		}
