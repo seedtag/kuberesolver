@@ -394,8 +394,10 @@ func TestCloseAbortsHangingList(t *testing.T) {
 	listing := make(chan struct{})
 	release := make(chan struct{})
 
+	var once sync.Once
+
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		close(listing)
+		once.Do(func() { close(listing) })
 
 		select {
 		case <-r.Context().Done():
@@ -411,7 +413,7 @@ func TestCloseAbortsHangingList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	<-listing
+	recv(t, listing)
 
 	closed := make(chan struct{})
 

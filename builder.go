@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,28 +21,34 @@ import (
 
 const (
 	kubernetesSchema = "kubernetes"
-	defaultFreq      = time.Minute * 30
+	// listTimeout bounds a LIST, so a hung request can't stop the resolver
+	// from handling watch events.
+	listTimeout = 30 * time.Second
 )
+
+// errWatchEvent is returned when the API server ends a watch with an ERROR
+// event, usually 410 Gone because the resourceVersion is too old.
+var errWatchEvent = errors.New("kuberesolver: watch returned an ERROR event")
 
 var (
 	endpointsForTarget = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "kuberesolver_endpoints_total",
-			Help: "The number of endpoints for a given target",
+			Help: "Endpoints across all EndpointSlices of the target's Service, ready or not",
 		},
 		[]string{"target"},
 	)
 	addressesForTarget = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "kuberesolver_addresses_total",
-			Help: "The number of addresses for a given target",
+			Help: "Unique ready addresses known for the target's Service",
 		},
 		[]string{"target"},
 	)
 	clientLastUpdate = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "kuberesolver_client_last_update",
-			Help: "The last time the resolver client was updated",
+			Help: "Unix time when gRPC was last confirmed to have the target's current addresses",
 		},
 		[]string{"target"},
 	)
@@ -169,12 +176,9 @@ func (b *kubeBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &kResolver{
 		target:    ti,
-		ctx:       ctx,
 		cancel:    cancel,
 		cc:        cc,
 		k8sClient: b.k8sClient,
-		t:         time.NewTimer(defaultFreq),
-		freq:      defaultFreq,
 		slices:    map[string]EndpointSlice{},
 
 		endpoints:      endpointsForTarget.WithLabelValues(ti.String()),
@@ -189,8 +193,9 @@ func (b *kubeBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts
 		defer r.wg.Done()
 
 		until(func() {
-			err := r.watch()
-			if err != nil && err != io.EOF {
+			err := r.watch(ctx)
+			// Errors caused by Close are expected and not worth a log line.
+			if err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
 				grpclog.Errorf("kuberesolver: watching ended with error='%v', will reconnect again", err)
 			}
 		}, time.Second, time.Second*30, ctx.Done())
@@ -207,14 +212,11 @@ func (b *kubeBuilder) Scheme() string {
 
 type kResolver struct {
 	target    targetInfo
-	ctx       context.Context
 	cancel    context.CancelFunc
 	cc        resolver.ClientConn
 	k8sClient K8sClient
 	// wg is used to enforce Close() to return after the watcher() goroutine has finished.
-	wg   sync.WaitGroup
-	t    *time.Timer
-	freq time.Duration
+	wg sync.WaitGroup
 
 	// slices holds the latest version of every EndpointSlice of the Service,
 	// keyed by slice name. A Service can be split over several slices (more
@@ -225,6 +227,10 @@ type kResolver struct {
 	// pushed is the address list last sent to gRPC. Sending gRPC the same
 	// list again costs it O(addresses) or worse, so update skips it.
 	pushed []resolver.Address
+
+	// missingPort is whether a slice lacked the named target port on the
+	// last update, so the warning is logged once, not on every event.
+	missingPort bool
 
 	endpoints prometheus.Gauge
 	addresses prometheus.Gauge
@@ -245,9 +251,11 @@ func (k *kResolver) Close() {
 	k.wg.Wait()
 }
 
-func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
+// makeAddresses returns the ready addresses of a slice. ok is false when the
+// target names a port the slice doesn't have.
+func (k *kResolver) makeAddresses(e EndpointSlice) (addrs []resolver.Address, ok bool) {
 	if len(e.Endpoints) == 0 {
-		return nil
+		return nil, true
 	}
 
 	// A numeric target port is used as is; otherwise take it from the slice.
@@ -257,24 +265,17 @@ func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
 	case k.target.useFirstPort:
 		if len(e.Ports) == 0 {
 			// No port from the target or the slice: nothing valid to publish.
-			return nil
+			return nil, true
 		}
 
 		port = strconv.Itoa(e.Ports[0].Port)
 	case k.target.resolveByPortName:
-		port = ""
-
-		for _, p := range e.Ports {
-			if p.Name == k.target.port {
-				port = strconv.Itoa(p.Port)
-				break
-			}
+		i := slices.IndexFunc(e.Ports, func(p EndpointPort) bool { return p.Name == k.target.port })
+		if i < 0 {
+			return nil, false
 		}
 
-		if port == "" {
-			grpclog.Warningf("kuberesolver: EndpointSlice %q has no port named %q, skipping it", e.Metadata.Name, k.target.port)
-			return nil
-		}
+		port = strconv.Itoa(e.Ports[i].Port)
 	}
 
 	serverName := k.target.serviceName + "." + k.target.serviceNamespace
@@ -290,12 +291,11 @@ func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
 			newAddrs = append(newAddrs, resolver.Address{
 				Addr:       net.JoinHostPort(address, port),
 				ServerName: serverName,
-				Metadata:   nil,
 			})
 		}
 	}
 
-	return newAddrs
+	return newAddrs, true
 }
 
 // applyEvent updates the slice cache from one watch event and pushes the
@@ -307,9 +307,8 @@ func (k *kResolver) applyEvent(e Event) {
 	case Deleted:
 		delete(k.slices, e.Object.Metadata.Name)
 	case Error:
-		// An ERROR event carries a Status, not an EndpointSlice. Other
-		// event types are already rejected by streamWatcher.Decode.
-		grpclog.Warningf("kuberesolver: ignoring ERROR event from the watch")
+		// watch handles ERROR events itself; this case keeps the switch
+		// exhaustive. Other event types are rejected by streamWatcher.Decode.
 		return
 	}
 
@@ -330,9 +329,14 @@ func (k *kResolver) update() {
 
 	addrs := make([]resolver.Address, 0, endpoints)
 	seen := make(map[string]struct{}, endpoints)
+	missingPort := false
 
 	for _, name := range names {
-		sliceAddrs := k.makeAddresses(k.slices[name])
+		sliceAddrs, ok := k.makeAddresses(k.slices[name])
+		if !ok {
+			missingPort = true
+		}
+
 		for _, a := range sliceAddrs {
 			// An endpoint can briefly be listed in two slices while the
 			// EndpointSlice controller moves it.
@@ -345,35 +349,67 @@ func (k *kResolver) update() {
 		}
 	}
 
+	if missingPort && !k.missingPort {
+		grpclog.Warningf("kuberesolver: %s: some EndpointSlices have no port named %q, their endpoints are skipped", k.target, k.target.port)
+
+		// Never resolved and nothing to connect to: make RPCs fail fast
+		// with this reason instead of waiting for their deadline.
+		if len(addrs) == 0 && len(k.pushed) == 0 {
+			k.cc.ReportError(fmt.Errorf("kuberesolver: no EndpointSlice of %s has a port named %q", k.target, k.target.port))
+		}
+	}
+
+	k.missingPort = missingPort
+
 	// With no ready addresses, keep the last state rather than leave gRPC
 	// with nothing to connect to.
 	if len(addrs) > 0 {
-		// The order is stable, so an unchanged set compares equal.
-		if !slices.EqualFunc(addrs, k.pushed, func(a, b resolver.Address) bool { return a.Addr == b.Addr }) {
-			_ = k.cc.UpdateState(resolver.State{
-				Addresses: addrs,
-			})
-			k.pushed = addrs
+		if !sameAddrs(addrs, k.pushed) {
+			if err := k.cc.UpdateState(resolver.State{Addresses: addrs}); err != nil {
+				// Leave pushed as it is, so the next update sends these again.
+				grpclog.Warningf("kuberesolver: gRPC rejected the addresses of %s: %v", k.target, err)
+			} else {
+				k.pushed = addrs
+			}
 		}
 
-		k.lastUpdateUnix.Set(float64(time.Now().Unix()))
+		if sameAddrs(addrs, k.pushed) {
+			k.lastUpdateUnix.Set(float64(time.Now().Unix()))
+		}
 	}
 
 	k.endpoints.Set(float64(endpoints))
 	k.addresses.Set(float64(len(addrs)))
 }
 
-// resolve lists all slices of the Service and replaces the cache with them, so
-// slices whose DELETED event was missed are dropped. It returns the list's
-// resourceVersion.
-func (k *kResolver) resolve() (string, error) {
-	// Next lookup should happen after an interval defined by k.freq.
-	defer k.t.Reset(k.freq)
+// sameAddrs reports whether two address lists are equal. Only Addr is
+// compared: ServerName is the same for every address of a resolver.
+func sameAddrs(a, b []resolver.Address) bool {
+	return slices.EqualFunc(a, b, func(x, y resolver.Address) bool { return x.Addr == y.Addr })
+}
 
-	list, err := getEndpointSliceList(k.ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
+// resolve lists all slices of the Service and replaces the cache with them, so
+// slices whose DELETED event was missed while the watch was down are dropped.
+// It returns the list's resourceVersion, or "" when the LIST failed. ctx is
+// the resolver's context.
+func (k *kResolver) resolve(ctx context.Context) string {
+	listCtx, cancel := context.WithTimeout(ctx, listTimeout)
+	defer cancel()
+
+	list, err := getEndpointSliceList(listCtx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
 	if err != nil {
-		grpclog.Errorf("kuberesolver: lookup endpoints failed (the service account needs the list verb on endpointslices): %v", err)
-		return "", err
+		var se *statusError
+
+		switch {
+		case ctx.Err() != nil:
+			// The resolver is closing.
+		case errors.As(err, &se) && se.code == http.StatusForbidden:
+			grpclog.Errorf("kuberesolver: lookup endpoints failed, the service account needs the list verb on endpointslices: %v", err)
+		default:
+			grpclog.Errorf("kuberesolver: lookup endpoints failed: %v", err)
+		}
+
+		return ""
 	}
 
 	cache := make(map[string]EndpointSlice, len(list.Items))
@@ -384,37 +420,41 @@ func (k *kResolver) resolve() (string, error) {
 	k.slices = cache
 	k.update()
 
-	return list.Metadata.ResourceVersion, nil
+	return list.Metadata.ResourceVersion
 }
 
-func (k *kResolver) watch() error {
+// watch runs one LIST-then-WATCH attempt until the watch ends or ctx is done.
+func (k *kResolver) watch(ctx context.Context) error {
 	// Start every (re)connect with a LIST, then watch from the list's
 	// resourceVersion: the watch then reports every change after the LIST,
 	// deletions included, and doesn't replay the slices the LIST returned.
 	// If the LIST fails (for example without the list verb), fall back to a
 	// watch without a version, which replays all current slices instead.
-	rv, _ := k.resolve()
+	rv := k.resolve(ctx)
+	if ctx.Err() != nil {
+		return nil
+	}
 
-	sw, err := watchEndpointSlice(k.ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName, rv)
+	sw, err := watchEndpointSlice(ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName, rv)
 	if err != nil {
 		return err
 	}
+	// Close the stream on every way out, including the ERROR event below,
+	// so the connection and its reader goroutine don't outlive this attempt.
+	defer sw.Stop()
 
 	for {
 		select {
-		case <-k.ctx.Done():
+		case <-ctx.Done():
 			return nil
-		case <-k.t.C:
-			_, _ = k.resolve()
 		case up, hasMore := <-sw.ResultChan():
 			if !hasMore {
 				return nil
 			}
 
 			if up.Type == Error {
-				// Usually 410 Gone: the version is too old to watch from.
 				// End this watch; the next attempt starts with a new LIST.
-				return errors.New("watch returned an ERROR event")
+				return fmt.Errorf("%w: %d %s: %s", errWatchEvent, up.Status.Code, up.Status.Reason, up.Status.Message)
 			}
 
 			k.applyEvent(up)

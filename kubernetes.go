@@ -163,6 +163,17 @@ func NewInsecureK8sClient(apiURL string) K8sClient {
 	}
 }
 
+// statusError is a response from the API server with a status other than 200.
+type statusError struct {
+	code      int
+	service   string
+	namespace string
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("invalid response code %d for service %s in namespace %s", e.code, e.service, e.namespace)
+}
+
 func getEndpointSliceList(ctx context.Context, client K8sClient, namespace, targetName string) (EndpointSliceList, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name=%s",
 		client.Host(), namespace, targetName))
@@ -187,7 +198,7 @@ func getEndpointSliceList(ctx context.Context, client K8sClient, namespace, targ
 	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return EndpointSliceList{}, fmt.Errorf("invalid response code %d for service %s in namespace %s", resp.StatusCode, targetName, namespace)
+		return EndpointSliceList{}, &statusError{code: resp.StatusCode, service: targetName, namespace: namespace}
 	}
 
 	result := EndpointSliceList{}
@@ -229,7 +240,7 @@ func watchEndpointSlice(ctx context.Context, client K8sClient, namespace, target
 			_ = Body.Close()
 		}(resp.Body)
 
-		return nil, fmt.Errorf("invalid response code %d for service %s in namespace %s", resp.StatusCode, targetName, namespace)
+		return nil, &statusError{code: resp.StatusCode, service: targetName, namespace: namespace}
 	}
 
 	return newStreamWatcher(resp.Body), nil

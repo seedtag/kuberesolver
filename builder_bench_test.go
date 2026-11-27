@@ -17,6 +17,8 @@ func (discardConn) UpdateState(resolver.State) error { return nil }
 
 // BenchmarkApplyEvent measures one MODIFIED watch event for a Service whose
 // pods are split into slices of 100, as the EndpointSlice controller does.
+// The event changes nothing, so it measures building and comparing the
+// address list; the gRPC push is skipped.
 func BenchmarkApplyEvent(b *testing.B) {
 	for _, total := range []int{200, 2_000, 10_000} {
 		b.Run(fmt.Sprintf("pods=%d", total), func(b *testing.B) {
