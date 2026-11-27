@@ -163,7 +163,7 @@ func NewInsecureK8sClient(apiURL string) K8sClient {
 	}
 }
 
-func getEndpointSliceList(client K8sClient, namespace, targetName string) (EndpointSliceList, error) {
+func getEndpointSliceList(ctx context.Context, client K8sClient, namespace, targetName string) (EndpointSliceList, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name=%s",
 		client.Host(), namespace, targetName))
 	if err != nil {
@@ -174,6 +174,9 @@ func getEndpointSliceList(client K8sClient, namespace, targetName string) (Endpo
 	if err != nil {
 		return EndpointSliceList{}, err
 	}
+
+	// Abort the request when the resolver is closed.
+	req = req.WithContext(ctx)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -193,11 +196,20 @@ func getEndpointSliceList(client K8sClient, namespace, targetName string) (Endpo
 	return result, err
 }
 
-func watchEndpointSlice(ctx context.Context, client K8sClient, namespace, targetName string) (watchInterface, error) {
+// watchEndpointSlice opens a watch on the slices of a Service. With a
+// resourceVersion, it reports only changes after that version. Without one,
+// it first replays every existing slice as an ADDED event.
+func watchEndpointSlice(ctx context.Context, client K8sClient, namespace, targetName, resourceVersion string) (watchInterface, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/apis/discovery.k8s.io/v1/watch/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name=%s",
 		client.Host(), namespace, targetName))
 	if err != nil {
 		return nil, err
+	}
+
+	if resourceVersion != "" {
+		q := u.Query()
+		q.Set("resourceVersion", resourceVersion)
+		u.RawQuery = q.Encode()
 	}
 
 	req, err := client.GetRequest(u.String())

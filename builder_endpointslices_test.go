@@ -1,6 +1,7 @@
 package kuberesolver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,8 +64,10 @@ func (rc *recordingConn) pushes() int {
 }
 
 const (
-	addrA = "10.0.0.1:9000"
-	addrB = "10.0.0.2:9000"
+	ipA   = "10.0.0.1"
+	ipB   = "10.0.0.2"
+	addrA = ipA + ":9000"
+	addrB = ipB + ":9000"
 )
 
 // grpcPortName is the name of the port in the test slices.
@@ -85,8 +89,8 @@ func TestWatchMergesMultipleEndpointSlices(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprintf(w, `{"type":"ADDED","object":`+sliceJSON+"}\n", "svc-a", "10.0.0.1")
-		_, _ = fmt.Fprintf(w, `{"type":"ADDED","object":`+sliceJSON+"}\n", "svc-b", "10.0.0.2")
+		_, _ = fmt.Fprintf(w, `{"type":"ADDED","object":`+sliceJSON+"}\n", "svc-a", ipA)
+		_, _ = fmt.Fprintf(w, `{"type":"ADDED","object":`+sliceJSON+"}\n", "svc-b", ipB)
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	}))
@@ -108,13 +112,14 @@ func TestWatchMergesMultipleEndpointSlices(t *testing.T) {
 
 // newTestResolver returns a kResolver wired to rc without starting the watch
 // goroutine, so tests can feed it events directly.
-func newTestResolver(t *testing.T, rc resolver.ClientConn, client K8sClient) *kResolver {
-	t.Helper()
+func newTestResolver(tb testing.TB, rc resolver.ClientConn, client K8sClient) *kResolver {
+	tb.Helper()
 
-	label := t.Name()
+	label := tb.Name()
 
 	return &kResolver{
 		target:         targetInfo{serviceName: "svc", serviceNamespace: "ns", port: grpcPortName, resolveByPortName: true},
+		ctx:            context.Background(),
 		cc:             rc,
 		k8sClient:      client,
 		t:              time.NewTimer(time.Hour),
@@ -148,7 +153,7 @@ func TestApplyEventMergesSlices(t *testing.T) {
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, nil)
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1", "10.0.0.2")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA, ipB)})
 	k.applyEvent(Event{Type: Added, Object: slice("svc-b", "10.0.0.3")})
 
 	assert.Equal(t, []string{addrA, addrB, "10.0.0.3:9000"}, rc.addrs())
@@ -160,8 +165,8 @@ func TestApplyEventModifiedReplacesOnlyThatSlice(t *testing.T) {
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, nil)
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1")})
-	k.applyEvent(Event{Type: Added, Object: slice("svc-b", "10.0.0.2")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-b", ipB)})
 	k.applyEvent(Event{Type: Modified, Object: slice("svc-a", "10.0.0.9")})
 
 	assert.Equal(t, []string{addrB, "10.0.0.9:9000"}, rc.addrs())
@@ -171,9 +176,9 @@ func TestApplyEventDeletedRemovesSlice(t *testing.T) {
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, nil)
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1")})
-	k.applyEvent(Event{Type: Added, Object: slice("svc-b", "10.0.0.2")})
-	k.applyEvent(Event{Type: Deleted, Object: slice("svc-b", "10.0.0.2")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-b", ipB)})
+	k.applyEvent(Event{Type: Deleted, Object: slice("svc-b", ipB)})
 
 	assert.Equal(t, []string{addrA}, rc.addrs())
 }
@@ -182,8 +187,8 @@ func TestApplyEventDeletingLastSliceKeepsLastState(t *testing.T) {
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, nil)
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1")})
-	k.applyEvent(Event{Type: Deleted, Object: slice("svc-a", "10.0.0.1")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
+	k.applyEvent(Event{Type: Deleted, Object: slice("svc-a", ipA)})
 
 	// Same behaviour as before the fix: an empty list is never pushed.
 	assert.Equal(t, 1, rc.pushes())
@@ -195,7 +200,7 @@ func TestApplyEventDualStack(t *testing.T) {
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, nil)
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-ipv4", "10.0.0.1")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-ipv4", ipA)})
 	k.applyEvent(Event{Type: Added, Object: slice("svc-ipv6", "fd00::1")})
 
 	assert.Equal(t, []string{addrA, "[fd00::1]:9000"}, rc.addrs())
@@ -207,8 +212,8 @@ func TestApplyEventDeduplicatesAddresses(t *testing.T) {
 
 	// The EndpointSlice controller can list an endpoint in two slices while
 	// it moves it from one to the other.
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1", "10.0.0.2")})
-	k.applyEvent(Event{Type: Added, Object: slice("svc-b", "10.0.0.2")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA, ipB)})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-b", ipB)})
 
 	assert.Equal(t, []string{addrA, addrB}, rc.addrs())
 }
@@ -217,7 +222,7 @@ func TestApplyEventIgnoresErrorEvents(t *testing.T) {
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, nil)
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
 	k.applyEvent(Event{Type: Error})
 
 	assert.Equal(t, 1, rc.pushes())
@@ -229,10 +234,10 @@ func TestApplyEventSkipsSliceWithoutPorts(t *testing.T) {
 	k := newTestResolver(t, rc, nil)
 	k.target = targetInfo{serviceName: "svc", serviceNamespace: "ns", useFirstPort: true}
 
-	noPorts := slice("svc-b", "10.0.0.2")
+	noPorts := slice("svc-b", ipB)
 	noPorts.Ports = nil
 
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
 	k.applyEvent(Event{Type: Added, Object: noPorts})
 
 	assert.Equal(t, []string{addrA}, rc.addrs())
@@ -243,7 +248,7 @@ func TestApplyEventSkipsSliceWithoutPorts(t *testing.T) {
 func TestResolveReplacesCache(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"items":[`+sliceJSON+`,`+sliceJSON+`]}`, "svc-a", "10.0.0.1", "svc-b", "10.0.0.2")
+		_, _ = fmt.Fprintf(w, `{"items":[`+sliceJSON+`,`+sliceJSON+`]}`, "svc-a", ipA, "svc-b", ipB)
 	}))
 	defer srv.Close()
 
@@ -251,7 +256,8 @@ func TestResolveReplacesCache(t *testing.T) {
 	k := newTestResolver(t, rc, NewInsecureK8sClient(srv.URL))
 	k.slices["svc-stale"] = slice("svc-stale", "10.9.9.9")
 
-	k.resolve()
+	_, err := k.resolve()
+	assert.NoError(t, err)
 
 	assert.Equal(t, []string{addrA, addrB}, rc.addrs())
 	assert.NotContains(t, k.slices, "svc-stale")
@@ -267,9 +273,10 @@ func TestResolveKeepsCacheOnListError(t *testing.T) {
 
 	rc := &recordingConn{}
 	k := newTestResolver(t, rc, NewInsecureK8sClient(srv.URL))
-	k.applyEvent(Event{Type: Added, Object: slice("svc-a", "10.0.0.1")})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
 
-	k.resolve()
+	_, err := k.resolve()
+	assert.Error(t, err)
 
 	assert.Equal(t, 1, rc.pushes())
 	assert.Contains(t, k.slices, "svc-a")
@@ -403,8 +410,8 @@ func TestScaleNotReadyPods(t *testing.T) {
 	notReady := false
 	slices := threeSlices()
 
-	// In svc-b, pods 100-129 are not ready, and pod 130 has no ready
-	// condition at all, which also counts as not ready.
+	// In svc-b, pods 100-129 are not ready. Pod 130 has no ready condition
+	// at all, which the API defines as ready.
 	for i := 0; i < 30; i++ {
 		slices[1].Endpoints[i].Conditions.Ready = &notReady
 	}
@@ -415,9 +422,9 @@ func TestScaleNotReadyPods(t *testing.T) {
 		k.applyEvent(Event{Type: Added, Object: s})
 	}
 
-	assert.Equal(t, podAddrs(pods(0, 100), pods(131, 69), pods(200, 50)), rc.addrs())
+	assert.Equal(t, podAddrs(pods(0, 100), pods(130, 70), pods(200, 50)), rc.addrs())
 	assert.Equal(t, 250.0, testutil.ToFloat64(k.endpoints))
-	assert.Equal(t, 219.0, testutil.ToFloat64(k.addresses))
+	assert.Equal(t, 220.0, testutil.ToFloat64(k.addresses))
 
 	// Then every pod in svc-c becomes not ready. The other slices must stay.
 	allNotReady := slice("svc-c", pods(200, 50)...)
@@ -427,9 +434,9 @@ func TestScaleNotReadyPods(t *testing.T) {
 
 	k.applyEvent(Event{Type: Modified, Object: allNotReady})
 
-	assert.Equal(t, podAddrs(pods(0, 100), pods(131, 69)), rc.addrs())
+	assert.Equal(t, podAddrs(pods(0, 100), pods(130, 70)), rc.addrs())
 	assert.Equal(t, 250.0, testutil.ToFloat64(k.endpoints))
-	assert.Equal(t, 169.0, testutil.ToFloat64(k.addresses))
+	assert.Equal(t, 170.0, testutil.ToFloat64(k.addresses))
 }
 
 // TestScaleEndToEnd sends the 250-pod Service through the real HTTP path, once
@@ -526,12 +533,11 @@ func TestMakeAddressesPort(t *testing.T) {
 			want:   nil,
 		},
 		{
-			// Known bug, not fixed yet: the unmatched port name ends up in the
-			// address. Update this case when the bug is fixed.
-			name:   "named target port missing from the slice",
+			// Publishing "ip:http" would give gRPC an address it can't dial.
+			name:   "named target port missing from the slice skips it",
 			target: "kubernetes:///svc.ns:http",
 			ports:  []EndpointPort{grpcPort},
-			want:   []string{"10.0.0.1:http"},
+			want:   nil,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -542,7 +548,7 @@ func TestMakeAddressesPort(t *testing.T) {
 
 			k := &kResolver{target: ti}
 
-			s := slice("svc-a", "10.0.0.1")
+			s := slice("svc-a", ipA)
 			s.Ports = tc.ports
 
 			var got []string
@@ -553,4 +559,249 @@ func TestMakeAddressesPort(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// listJSON renders an EndpointSliceList with the given resourceVersion.
+func listJSON(rv string, items ...EndpointSlice) string {
+	b, err := json.Marshal(EndpointSliceList{Metadata: ListMetadata{ResourceVersion: rv}, Items: items})
+	if err != nil {
+		panic(err)
+	}
+
+	return string(b)
+}
+
+// buildResolver builds a resolver for svc.ns:grpc against apiURL and closes
+// it when the test ends.
+func buildResolver(t *testing.T, apiURL string) *recordingConn {
+	t.Helper()
+
+	rc := &recordingConn{}
+
+	rs, err := NewBuilder(NewInsecureK8sClient(apiURL), kubernetesSchema).
+		Build(parseTarget("kubernetes:///svc.ns:grpc"), rc, resolver.BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(rs.Close)
+
+	return rc
+}
+
+// TestWatchStartsFromListResourceVersion checks that the watch starts where
+// the LIST ended, so it reports a deletion that happens after the LIST.
+func TestWatchStartsFromListResourceVersion(t *testing.T) {
+	watchRV := make(chan string, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if !strings.Contains(r.URL.Path, "/watch/") {
+			_, _ = w.Write([]byte(listJSON("42", slice("svc-a", ipA), slice("svc-b", ipB))))
+			return
+		}
+
+		watchRV <- r.URL.Query().Get("resourceVersion")
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"type":"DELETED","object":`+sliceJSON+"}\n", "svc-b", ipB)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	// Cleanup, not defer: the resolver must close before the server.
+	t.Cleanup(srv.Close)
+
+	rc := buildResolver(t, srv.URL)
+
+	assert.Equal(t, "42", <-watchRV)
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, []string{addrA}, rc.addrs())
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// TestWatchErrorEventRelists checks that an ERROR event (for example 410 Gone
+// when the version is too old) ends the watch and starts again with a LIST.
+func TestWatchErrorEventRelists(t *testing.T) {
+	var lists atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if !strings.Contains(r.URL.Path, "/watch/") {
+			// The second LIST sees a new pod.
+			if lists.Add(1) == 1 {
+				_, _ = w.Write([]byte(listJSON("1", slice("svc-a", ipA))))
+			} else {
+				_, _ = w.Write([]byte(listJSON("2", slice("svc-a", ipB))))
+			}
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+
+		if r.URL.Query().Get("resourceVersion") == "1" {
+			// Keep the stream open after the ERROR: only the resolver
+			// ending the watch itself leads to the second LIST.
+			_, _ = w.Write([]byte(`{"type":"ERROR","object":{"kind":"Status","code":410,"reason":"Expired"}}` + "\n"))
+		}
+
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	// Cleanup, not defer: the resolver must close before the server.
+	t.Cleanup(srv.Close)
+
+	rc := buildResolver(t, srv.URL)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, []string{addrB}, rc.addrs())
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// TestWatchWithoutListPermission checks that a service account with only the
+// get and watch verbs still resolves: the LIST fails, and the resolver falls
+// back to a watch without a version, which replays the current slices.
+func TestWatchWithoutListPermission(t *testing.T) {
+	watchRV := make(chan string, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/watch/") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		watchRV <- r.URL.Query().Get("resourceVersion")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"type":"ADDED","object":`+sliceJSON+"}\n", "svc-a", ipA)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	// Cleanup, not defer: the resolver must close before the server.
+	t.Cleanup(srv.Close)
+
+	rc := buildResolver(t, srv.URL)
+
+	assert.Empty(t, <-watchRV)
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, []string{addrA}, rc.addrs())
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// TestWatchRetriesAfterWatchRequestFails checks that a failed watch request
+// is retried with a new LIST.
+func TestWatchRetriesAfterWatchRequestFails(t *testing.T) {
+	var watches atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/watch/") {
+			_, _ = w.Write([]byte(listJSON("1", slice("svc-a", ipA))))
+			return
+		}
+
+		if watches.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"type":"ADDED","object":`+sliceJSON+"}\n", "svc-b", ipB)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	// Cleanup, not defer: the resolver must close before the server.
+	t.Cleanup(srv.Close)
+
+	rc := buildResolver(t, srv.URL)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, []string{addrA, addrB}, rc.addrs())
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(2), watches.Load())
+}
+
+// TestPeriodicResyncDropsStaleSlice checks that the periodic LIST drops a
+// slice whose DELETED event never arrived, while the watch stays open.
+func TestPeriodicResyncDropsStaleSlice(t *testing.T) {
+	var lists atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/watch/") {
+			if lists.Add(1) == 1 {
+				_, _ = w.Write([]byte(listJSON("1", slice("svc-a", ipA), slice("svc-b", ipB))))
+			} else {
+				_, _ = w.Write([]byte(listJSON("2", slice("svc-a", ipA))))
+			}
+
+			return
+		}
+
+		// A watch that never reports anything.
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	rc := &recordingConn{}
+	k := newTestResolver(t, rc, NewInsecureK8sClient(srv.URL))
+	ctx, cancel := context.WithCancel(context.Background())
+	k.ctx = ctx
+	k.freq = 50 * time.Millisecond
+	k.t.Reset(k.freq)
+
+	done := make(chan struct{})
+
+	go func() {
+		_ = k.watch()
+
+		close(done)
+	}()
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, []string{addrA}, rc.addrs())
+	}, 5*time.Second, 10*time.Millisecond)
+
+	cancel()
+	<-done
+}
+
+func TestUpdateSkipsUnchangedAddresses(t *testing.T) {
+	rc := &recordingConn{}
+	k := newTestResolver(t, rc, nil)
+
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
+
+	// A change that leaves the ready addresses as they are, for example a
+	// pod in svc-b that is not ready yet.
+	notReady := false
+	b := slice("svc-b", ipB)
+	b.Endpoints[0].Conditions.Ready = &notReady
+	k.applyEvent(Event{Type: Added, Object: b})
+	k.applyEvent(Event{Type: Modified, Object: slice("svc-a", ipA)})
+
+	assert.Equal(t, 1, rc.pushes())
+	assert.Positive(t, testutil.ToFloat64(k.lastUpdateUnix))
+
+	// Once the pod is ready, the new address is pushed.
+	k.applyEvent(Event{Type: Modified, Object: slice("svc-b", ipB)})
+
+	assert.Equal(t, 2, rc.pushes())
+	assert.Equal(t, []string{addrA, addrB}, rc.addrs())
+}
+
+// TestUpdateAddressOrderIsStable checks the raw order sent to gRPC: slices in
+// name order, whatever order their events arrived in.
+func TestUpdateAddressOrderIsStable(t *testing.T) {
+	rc := &recordingConn{}
+	k := newTestResolver(t, rc, nil)
+
+	k.applyEvent(Event{Type: Added, Object: slice("svc-b", ipB)})
+	k.applyEvent(Event{Type: Added, Object: slice("svc-a", ipA)})
+
+	states := rc.allStates()
+	assert.Equal(t, []string{addrA, addrB}, states[len(states)-1])
 }

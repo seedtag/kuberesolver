@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -333,6 +334,8 @@ func (bc *blockingConn) UpdateState(resolver.State) error {
 // after the first reconnect Close returned while the goroutine was still
 // running, and the next attempt panicked on a negative WaitGroup counter.
 func TestCloseWaitsForWatchAfterReconnect(t *testing.T) {
+	var lists atomic.Int32
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -341,7 +344,9 @@ func TestCloseWaitsForWatchAfterReconnect(t *testing.T) {
 			return
 		}
 
-		_, _ = fmt.Fprintf(w, `{"items":[`+sliceJSON+`]}`, "svc-a", "10.0.0.1")
+		// A different address on every LIST, so each LIST pushes to gRPC
+		// (unchanged addresses are not pushed again).
+		_, _ = fmt.Fprintf(w, `{"items":[`+sliceJSON+`]}`, "svc-a", fmt.Sprintf("10.0.0.%d", lists.Add(1)))
 	}))
 	defer srv.Close()
 
@@ -380,5 +385,44 @@ func TestCloseWaitsForWatchAfterReconnect(t *testing.T) {
 	case <-closed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not return after the watch goroutine finished")
+	}
+}
+
+// TestCloseAbortsHangingList checks that Close doesn't wait for a LIST the
+// API server never answers.
+func TestCloseAbortsHangingList(t *testing.T) {
+	listing := make(chan struct{})
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(listing)
+
+		select {
+		case <-r.Context().Done():
+		case <-release: // lets the server shut down if the test fails
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	rs, err := NewBuilder(NewInsecureK8sClient(srv.URL), kubernetesSchema).
+		Build(parseTarget("kubernetes:///svc.ns:grpc"), &recordingConn{}, resolver.BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	<-listing
+
+	closed := make(chan struct{})
+
+	go func() {
+		rs.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close is stuck behind a LIST that never returns")
 	}
 }

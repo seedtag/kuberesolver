@@ -68,7 +68,34 @@ Since it provides and updates all available service endpoints, together with a c
 
 ### RBAC
 
-You need give `GET` and `WATCH` access to the `endpointslices` if you are using RBAC in your cluster.
+If you use RBAC in your cluster, the service account needs the `get`, `list` and `watch` verbs on `endpointslices`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kuberesolver
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+```
+
+Without `list`, kuberesolver still works, but it logs an error on every reconnect and can keep the addresses of a deleted EndpointSlice until the next successful list.
+
+### Services with several EndpointSlices
+
+Kubernetes splits a Service into several EndpointSlices when it has more than 100 endpoints (by default), and dual-stack Services have one EndpointSlice per IP family. kuberesolver merges all of them and gives gRPC every ready address once. A dual-stack pod therefore gets two addresses, one IPv4 and one IPv6, and gRPC opens a connection to each.
+
+### Metrics
+
+Each target exports three Prometheus gauges, labelled with `target`:
+
+| Metric | Meaning |
+| --- | --- |
+| `kuberesolver_endpoints_total` | Endpoints across all EndpointSlices of the Service, ready or not. An endpoint can be counted twice for a moment while Kubernetes moves it between slices. |
+| `kuberesolver_addresses_total` | Unique ready addresses, as given to gRPC. |
+| `kuberesolver_client_last_update` | Unix time of the last time gRPC was confirmed to have the current addresses. |
 
 
 ### Using With TLS

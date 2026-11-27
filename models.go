@@ -16,7 +16,12 @@ type Event struct {
 }
 
 type EndpointSliceList struct {
-	Items []EndpointSlice
+	Metadata ListMetadata `json:"metadata"`
+	Items    []EndpointSlice
+}
+
+type ListMetadata struct {
+	ResourceVersion string `json:"resourceVersion"`
 }
 
 type EndpointSlice struct {
