@@ -66,6 +66,9 @@ const (
 	addrB = "10.0.0.2:9000"
 )
 
+// grpcPortName is the name of the port in the test slices.
+const grpcPortName = "grpc"
+
 const sliceJSON = `{"metadata":{"name":%q},"endpoints":[{"addresses":[%q],"conditions":{"ready":true}}],"ports":[{"name":"grpc","port":9000}]}`
 
 // TestWatchMergesMultipleEndpointSlices drives the real watch path: the API
@@ -111,7 +114,7 @@ func newTestResolver(t *testing.T, rc resolver.ClientConn, client K8sClient) *kR
 	label := t.Name()
 
 	return &kResolver{
-		target:         targetInfo{serviceName: "svc", serviceNamespace: "ns", port: "grpc", resolveByPortName: true},
+		target:         targetInfo{serviceName: "svc", serviceNamespace: "ns", port: grpcPortName, resolveByPortName: true},
 		cc:             rc,
 		k8sClient:      client,
 		t:              time.NewTimer(time.Hour),
@@ -129,7 +132,7 @@ func slice(name string, addrs ...string) EndpointSlice {
 
 	s := EndpointSlice{
 		Metadata: Metadata{Name: name},
-		Ports:    []EndpointPort{{Name: "grpc", Port: 9000}},
+		Ports:    []EndpointPort{{Name: grpcPortName, Port: 9000}},
 	}
 	for _, a := range addrs {
 		s.Endpoints = append(s.Endpoints, Endpoint{
@@ -473,6 +476,81 @@ func TestScaleEndToEnd(t *testing.T) {
 			assert.EventuallyWithT(t, func(c *assert.CollectT) {
 				assert.Equal(c, podAddrs(pods(0, 250)), rc.addrs())
 			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
+// TestMakeAddressesPort checks where the port of each address comes from: the
+// target string, the slice's ports, or nowhere. Target and slice use different
+// numbers so the source of the port is always visible.
+func TestMakeAddressesPort(t *testing.T) {
+	grpcPort := EndpointPort{Name: grpcPortName, Port: 9000}
+	metricsPort := EndpointPort{Name: "metrics", Port: 9100}
+
+	for _, tc := range []struct {
+		name   string
+		target string
+		ports  []EndpointPort
+		want   []string
+	}{
+		{
+			name:   "numeric target port wins over slice ports",
+			target: "kubernetes:///svc.ns:8080",
+			ports:  []EndpointPort{grpcPort},
+			want:   []string{"10.0.0.1:8080"},
+		},
+		{
+			name:   "named target port is looked up in the slice",
+			target: "kubernetes:///svc.ns:grpc",
+			ports:  []EndpointPort{metricsPort, grpcPort},
+			want:   []string{"10.0.0.1:9000"},
+		},
+		{
+			name:   "no target port uses the slice's first port",
+			target: "kubernetes:///svc.ns",
+			ports:  []EndpointPort{metricsPort, grpcPort},
+			want:   []string{"10.0.0.1:9100"},
+		},
+		{
+			// A headless Service can have no ports. This case fails if the
+			// empty-port check in makeAddresses is moved before the loop.
+			name:   "numeric target port with no slice ports",
+			target: "kubernetes:///svc.ns:8080",
+			ports:  nil,
+			want:   []string{"10.0.0.1:8080"},
+		},
+		{
+			name:   "no port anywhere skips the slice",
+			target: "kubernetes:///svc.ns",
+			ports:  nil,
+			want:   nil,
+		},
+		{
+			// Known bug, not fixed yet: the unmatched port name ends up in the
+			// address. Update this case when the bug is fixed.
+			name:   "named target port missing from the slice",
+			target: "kubernetes:///svc.ns:http",
+			ports:  []EndpointPort{grpcPort},
+			want:   []string{"10.0.0.1:http"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ti, err := parseResolverTarget(parseTarget(tc.target))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			k := &kResolver{target: ti}
+
+			s := slice("svc-a", "10.0.0.1")
+			s.Ports = tc.ports
+
+			var got []string
+			for _, a := range k.makeAddresses(s) {
+				got = append(got, a.Addr)
+			}
+
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }

@@ -251,14 +251,9 @@ func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
 		}
 	}
 
-	if len(port) == 0 {
-		if len(e.Ports) == 0 {
-			// No port to use. Skip this slice instead of panicking, which
-			// would now also drop the addresses of every other slice.
-			return nil
-		}
-
-		port = strconv.Itoa(e.Ports[0].Port)
+	// No port from the target or the slice: nothing valid to publish.
+	if port == "" {
+		return nil
 	}
 
 	var newAddrs []resolver.Address
