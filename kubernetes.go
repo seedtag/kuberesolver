@@ -163,7 +163,18 @@ func NewInsecureK8sClient(apiURL string) K8sClient {
 	}
 }
 
-func getEndpointSliceList(client K8sClient, namespace, targetName string) (EndpointSliceList, error) {
+// statusError is a response from the API server with a status other than 200.
+type statusError struct {
+	code      int
+	service   string
+	namespace string
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("invalid response code %d for service %s in namespace %s", e.code, e.service, e.namespace)
+}
+
+func getEndpointSliceList(ctx context.Context, client K8sClient, namespace, targetName string) (EndpointSliceList, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name=%s",
 		client.Host(), namespace, targetName))
 	if err != nil {
@@ -175,6 +186,9 @@ func getEndpointSliceList(client K8sClient, namespace, targetName string) (Endpo
 		return EndpointSliceList{}, err
 	}
 
+	// Abort the request when the resolver is closed.
+	req = req.WithContext(ctx)
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return EndpointSliceList{}, err
@@ -184,7 +198,7 @@ func getEndpointSliceList(client K8sClient, namespace, targetName string) (Endpo
 	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return EndpointSliceList{}, fmt.Errorf("invalid response code %d for service %s in namespace %s", resp.StatusCode, targetName, namespace)
+		return EndpointSliceList{}, &statusError{code: resp.StatusCode, service: targetName, namespace: namespace}
 	}
 
 	result := EndpointSliceList{}
@@ -193,11 +207,20 @@ func getEndpointSliceList(client K8sClient, namespace, targetName string) (Endpo
 	return result, err
 }
 
-func watchEndpointSlice(ctx context.Context, client K8sClient, namespace, targetName string) (watchInterface, error) {
+// watchEndpointSlice opens a watch on the slices of a Service. With a
+// resourceVersion, it reports only changes after that version. Without one,
+// it first replays every existing slice as an ADDED event.
+func watchEndpointSlice(ctx context.Context, client K8sClient, namespace, targetName, resourceVersion string) (watchInterface, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/apis/discovery.k8s.io/v1/watch/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name=%s",
 		client.Host(), namespace, targetName))
 	if err != nil {
 		return nil, err
+	}
+
+	if resourceVersion != "" {
+		q := u.Query()
+		q.Set("resourceVersion", resourceVersion)
+		u.RawQuery = q.Encode()
 	}
 
 	req, err := client.GetRequest(u.String())
@@ -217,7 +240,7 @@ func watchEndpointSlice(ctx context.Context, client K8sClient, namespace, target
 			_ = Body.Close()
 		}(resp.Body)
 
-		return nil, fmt.Errorf("invalid response code %d for service %s in namespace %s", resp.StatusCode, targetName, namespace)
+		return nil, &statusError{code: resp.StatusCode, service: targetName, namespace: namespace}
 	}
 
 	return newStreamWatcher(resp.Body), nil

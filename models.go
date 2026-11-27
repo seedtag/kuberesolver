@@ -13,10 +13,26 @@ const (
 type Event struct {
 	Type   EventType     `json:"type"`
 	Object EndpointSlice `json:"object"`
+	// Status is the error an ERROR event carries instead of an EndpointSlice.
+	Status Status `json:"-"`
+}
+
+// Status is the error the API server sends in an ERROR watch event, for
+// example code 410 when the requested resourceVersion is too old.
+type Status struct {
+	Code    int    `json:"code"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
 }
 
 type EndpointSliceList struct {
-	Items []EndpointSlice
+	Metadata ListMetadata `json:"metadata"`
+	Items    []EndpointSlice
+}
+
+// ListMetadata is the part of a list's metadata the resolver reads.
+type ListMetadata struct {
+	ResourceVersion string `json:"resourceVersion"`
 }
 
 type EndpointSlice struct {

@@ -26,6 +26,7 @@ type watchInterface interface {
 // into a watch.Interface.
 type streamWatcher struct {
 	result  chan Event
+	done    chan struct{} // closed by Stop
 	r       io.ReadCloser
 	decoder *json.Decoder
 	sync.Mutex
@@ -38,6 +39,7 @@ func newStreamWatcher(r io.ReadCloser) watchInterface {
 		r:       r,
 		decoder: json.NewDecoder(r),
 		result:  make(chan Event),
+		done:    make(chan struct{}),
 	}
 	go sw.receive()
 
@@ -56,6 +58,7 @@ func (sw *streamWatcher) Stop() {
 
 	if !sw.stopped {
 		sw.stopped = true
+		close(sw.done)
 		_ = sw.r.Close()
 	}
 }
@@ -95,21 +98,36 @@ func (sw *streamWatcher) receive() {
 			return
 		}
 
-		sw.result <- obj
+		// Don't block forever on a reader that stopped listening.
+		select {
+		case sw.result <- obj:
+		case <-sw.done:
+			return
+		}
 	}
 }
 
 // Decode blocks until it can return the next object in the writer. Returns an error
 // if the writer is closed or an object can't be decoded.
 func (sw *streamWatcher) Decode() (Event, error) {
-	var got Event
+	// The object is an EndpointSlice, or a Status for ERROR events. Decoding
+	// into both at once avoids a second pass over the JSON.
+	var got struct {
+		Type   EventType `json:"type"`
+		Object struct {
+			EndpointSlice
+			Status
+		} `json:"object"`
+	}
 	if err := sw.decoder.Decode(&got); err != nil {
 		return Event{}, err
 	}
 
 	switch got.Type {
-	case Added, Modified, Deleted, Error:
-		return got, nil
+	case Added, Modified, Deleted:
+		return Event{Type: got.Type, Object: got.Object.EndpointSlice}, nil
+	case Error:
+		return Event{Type: got.Type, Status: got.Object.Status}, nil
 	default:
 		return Event{}, fmt.Errorf("got invalid watch event type: %v", got.Type)
 	}
