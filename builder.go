@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,6 +174,7 @@ func (b *kubeBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts
 		k8sClient: b.k8sClient,
 		t:         time.NewTimer(defaultFreq),
 		freq:      defaultFreq,
+		slices:    map[string]EndpointSlice{},
 
 		endpoints:      endpointsForTarget.WithLabelValues(ti.String()),
 		addresses:      addressesForTarget.WithLabelValues(ti.String()),
@@ -207,6 +209,12 @@ type kResolver struct {
 	t    *time.Timer
 	freq time.Duration
 
+	// slices holds the latest version of every EndpointSlice of the Service,
+	// keyed by slice name. A Service can be split over several slices (more
+	// than ~100 endpoints, dual-stack), and gRPC must get the union of all of
+	// them. Only the watch goroutine reads or writes it.
+	slices map[string]EndpointSlice
+
 	endpoints prometheus.Gauge
 	addresses prometheus.Gauge
 	// lastUpdateUnix is the timestamp of the last successful update to the resolver client
@@ -225,7 +233,7 @@ func (k *kResolver) Close() {
 	k.wg.Wait()
 }
 
-func (k *kResolver) makeAddresses(e EndpointSlice) ([]resolver.Address, string) {
+func (k *kResolver) makeAddresses(e EndpointSlice) []resolver.Address {
 	port := k.target.port
 	for _, p := range e.Ports {
 		if k.target.useFirstPort {
@@ -238,6 +246,12 @@ func (k *kResolver) makeAddresses(e EndpointSlice) ([]resolver.Address, string) 
 	}
 
 	if len(port) == 0 {
+		if len(e.Ports) == 0 {
+			// No port to use. Skip this slice instead of panicking, which
+			// would now also drop the addresses of every other slice.
+			return nil
+		}
+
 		port = strconv.Itoa(e.Ports[0].Port)
 	}
 
@@ -257,11 +271,61 @@ func (k *kResolver) makeAddresses(e EndpointSlice) ([]resolver.Address, string) 
 		}
 	}
 
-	return newAddrs, ""
+	return newAddrs
 }
 
-func (k *kResolver) handle(e EndpointSlice) {
-	addrs, _ := k.makeAddresses(e)
+// applyEvent updates the slice cache from one watch event and pushes the
+// merged addresses to gRPC.
+func (k *kResolver) applyEvent(e Event) {
+	switch e.Type {
+	case Added, Modified:
+		k.slices[e.Object.Metadata.Name] = e.Object
+	case Deleted:
+		delete(k.slices, e.Object.Metadata.Name)
+	case Error:
+		// An ERROR event carries a Status, not an EndpointSlice. Other
+		// event types are already rejected by streamWatcher.Decode.
+		grpclog.Warningf("kuberesolver: ignoring ERROR event from the watch")
+		return
+	}
+
+	k.update()
+}
+
+// update pushes the union of the addresses of all cached slices to gRPC.
+func (k *kResolver) update() {
+	names := make([]string, 0, len(k.slices))
+	for name := range k.slices {
+		names = append(names, name)
+	}
+	// Sort so the address order is the same for the same set of slices.
+	sort.Strings(names)
+
+	var (
+		addrs     []resolver.Address
+		endpoints int
+		seen      = map[string]struct{}{}
+	)
+
+	for _, name := range names {
+		s := k.slices[name]
+		endpoints += len(s.Endpoints)
+
+		sliceAddrs := k.makeAddresses(s)
+		for _, a := range sliceAddrs {
+			// An endpoint can briefly be listed in two slices while the
+			// EndpointSlice controller moves it.
+			if _, ok := seen[a.Addr]; ok {
+				continue
+			}
+
+			seen[a.Addr] = struct{}{}
+			addrs = append(addrs, a)
+		}
+	}
+
+	// With no ready addresses, keep the last state rather than leave gRPC
+	// with nothing to connect to.
 	if len(addrs) > 0 {
 		_ = k.cc.UpdateState(resolver.State{
 			Addresses: addrs,
@@ -269,16 +333,22 @@ func (k *kResolver) handle(e EndpointSlice) {
 		k.lastUpdateUnix.Set(float64(time.Now().Unix()))
 	}
 
-	k.endpoints.Set(float64(len(e.Endpoints)))
+	k.endpoints.Set(float64(endpoints))
 	k.addresses.Set(float64(len(addrs)))
 }
 
+// resolve lists all slices of the Service and replaces the cache with them, so
+// slices whose DELETED event was missed are dropped.
 func (k *kResolver) resolve() {
 	list, err := getEndpointSliceList(k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
 	if err == nil {
-		for _, e := range list.Items {
-			k.handle(e)
+		slices := make(map[string]EndpointSlice, len(list.Items))
+		for _, s := range list.Items {
+			slices[s.Metadata.Name] = s
 		}
+
+		k.slices = slices
+		k.update()
 	} else {
 		grpclog.Errorf("kuberesolver: lookup endpoints failed: %v", err)
 	}
@@ -288,7 +358,11 @@ func (k *kResolver) resolve() {
 
 func (k *kResolver) watch() error {
 	defer k.wg.Done()
-	// watch endpoints lists existing endpoints at start
+	// Start every (re)connect from a fresh LIST: the cache may still hold
+	// slices that were deleted while the previous watch was down, and the
+	// watch below only reports slices that exist now.
+	k.resolve()
+
 	sw, err := watchEndpointSlice(k.ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
 	if err != nil {
 		return err
@@ -302,7 +376,7 @@ func (k *kResolver) watch() error {
 			k.resolve()
 		case up, hasMore := <-sw.ResultChan():
 			if hasMore {
-				k.handle(up.Object)
+				k.applyEvent(up)
 			} else {
 				return nil
 			}

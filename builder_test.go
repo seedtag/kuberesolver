@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,17 +104,33 @@ func getTestAPIURL(t *testing.T) (apiURL string, cleanup func()) {
 
 type fakeConn struct {
 	cmp   chan struct{}
+	mu    sync.Mutex
 	found []string
 }
 
+func (fc *fakeConn) foundCount() int {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	return len(fc.found)
+}
+
 func (fc *fakeConn) UpdateState(state resolver.State) error {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
 	for i, a := range state.Addresses {
 		fc.found = append(fc.found, a.Addr)
 		fmt.Printf("%d, address: %s\n", i, a.Addr)
 		fmt.Printf("%d, servername: %s\n", i, a.ServerName)
 	}
 
-	fc.cmp <- struct{}{}
+	// Never block the resolver: it pushes once after the initial LIST and
+	// again for every watch event.
+	select {
+	case fc.cmp <- struct{}{}:
+	default:
+	}
 
 	return nil
 }
@@ -144,7 +161,7 @@ func TestBuilder(t *testing.T) {
 	cl := NewInsecureK8sClient(apiURL)
 	bl := NewBuilder(cl, kubernetesSchema)
 	fc := &fakeConn{
-		cmp: make(chan struct{}),
+		cmp: make(chan struct{}, 1),
 	}
 
 	rs, err := bl.Build(parseTarget("kubernetes://kube-dns.kube-system:53"), fc, resolver.BuildOptions{})
@@ -155,7 +172,7 @@ func TestBuilder(t *testing.T) {
 
 	<-fc.cmp
 
-	if len(fc.found) == 0 {
+	if fc.foundCount() == 0 {
 		t.Fatal("could not found endpoints")
 	}
 }
@@ -167,7 +184,7 @@ func TestResolveLag(t *testing.T) {
 	cl := NewInsecureK8sClient(apiURL)
 	bl := NewBuilder(cl, kubernetesSchema)
 	fc := &fakeConn{
-		cmp: make(chan struct{}),
+		cmp: make(chan struct{}, 1),
 	}
 
 	rs, err := bl.Build(parseTarget("kubernetes://kube-dns.kube-system:53"), fc, resolver.BuildOptions{})
@@ -178,7 +195,7 @@ func TestResolveLag(t *testing.T) {
 
 	<-fc.cmp
 
-	if len(fc.found) == 0 {
+	if fc.foundCount() == 0 {
 		t.Fatal("could not found endpoints")
 	}
 
