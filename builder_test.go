@@ -300,3 +300,85 @@ func TestParseTargets(t *testing.T) {
 		}
 	}
 }
+
+// blockingConn blocks in UpdateState on the push numbered blockOn (1-based)
+// until release is closed, so a test can hold the watch goroutine busy.
+type blockingConn struct {
+	resolver.ClientConn // unused methods; calling one panics
+
+	mu      sync.Mutex
+	pushes  int
+	blockOn int
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (bc *blockingConn) UpdateState(resolver.State) error {
+	bc.mu.Lock()
+	bc.pushes++
+	n := bc.pushes
+	bc.mu.Unlock()
+
+	if n == bc.blockOn {
+		close(bc.blocked)
+		<-bc.release
+	}
+
+	return nil
+}
+
+// TestCloseWaitsForWatchAfterReconnect checks that Close still waits for the
+// watch goroutine after the watch has reconnected. watch() used to call
+// wg.Done() on every attempt although Build only called wg.Add(1) once, so
+// after the first reconnect Close returned while the goroutine was still
+// running, and the next attempt panicked on a negative WaitGroup counter.
+func TestCloseWaitsForWatchAfterReconnect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(r.URL.Path, "/watch/") {
+			// End the stream at once so the resolver reconnects.
+			return
+		}
+
+		_, _ = fmt.Fprintf(w, `{"items":[`+sliceJSON+`]}`, "svc-a", "10.0.0.1")
+	}))
+	defer srv.Close()
+
+	// Push 1 is the LIST of the first watch attempt, push 2 the LIST of the
+	// second attempt after the reconnect: block there.
+	bc := &blockingConn{blockOn: 2, blocked: make(chan struct{}), release: make(chan struct{})}
+
+	rs, err := NewBuilder(NewInsecureK8sClient(srv.URL), kubernetesSchema).
+		Build(parseTarget("kubernetes:///svc.ns:grpc"), bc, resolver.BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-bc.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watch never reconnected")
+	}
+
+	closed := make(chan struct{})
+
+	go func() {
+		rs.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+		t.Fatal("Close returned while the watch goroutine was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(bc.release)
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the watch goroutine finished")
+	}
+}

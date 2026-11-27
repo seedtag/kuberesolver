@@ -182,12 +182,18 @@ func (b *kubeBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts
 	}
 	r.wg.Add(1)
 
-	go until(func() {
-		err := r.watch()
-		if err != nil && err != io.EOF {
-			grpclog.Errorf("kuberesolver: watching ended with error='%v', will reconnect again", err)
-		}
-	}, time.Second, time.Second*30, ctx.Done())
+	go func() {
+		// Done once, when the whole retry loop exits, not after each watch
+		// attempt: Close must wait until no attempt can run anymore.
+		defer r.wg.Done()
+
+		until(func() {
+			err := r.watch()
+			if err != nil && err != io.EOF {
+				grpclog.Errorf("kuberesolver: watching ended with error='%v', will reconnect again", err)
+			}
+		}, time.Second, time.Second*30, ctx.Done())
+	}()
 
 	return r, nil
 }
@@ -357,7 +363,6 @@ func (k *kResolver) resolve() {
 }
 
 func (k *kResolver) watch() error {
-	defer k.wg.Done()
 	// Start every (re)connect from a fresh LIST: the cache may still hold
 	// slices that were deleted while the previous watch was down, and the
 	// watch below only reports slices that exist now.
